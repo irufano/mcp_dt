@@ -1,7 +1,7 @@
 [project]
 name = "mcp-dt"
 version = "0.1.0"
-description = "Add your description here"
+description = "DT MCP Server"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -14,3 +14,7 @@ dependencies = [
     "mcp[cli]>=1.25.0",
     "python-dotenv>=1.2.1",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

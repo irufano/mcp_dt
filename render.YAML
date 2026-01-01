@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: mcp-calendar-server
+    runtime: python
+    buildCommand: pip install uv && uv sync
+    startCommand: uv run python server/http_server.py
+    envVars:
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false  # Set manually in Render dashboard
