@@ -13,7 +13,13 @@ Prerequisites:
 - Start the HTTP server first: python servers/http_server.py
 
 Run with:
-    python client/http_client.py
+    python clients/http_client.py
+
+    # Or connect to remote server:
+    python clients/http_client.py https://your-server.onrender.com/mcp
+
+    # Or set environment variable:
+    MCP_SERVER_URL=https://your-server.onrender.com/mcp python clients/http_client.py
 """
 
 import asyncio
@@ -39,6 +45,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mcp-genai-http-client")
 
+
 # Server URL - from command line, environment, or default
 def get_server_url() -> str:
     # 1. Command line argument
@@ -50,11 +57,11 @@ def get_server_url() -> str:
     # 3. Default local
     return "http://localhost:8000/mcp"
 
+
 SERVER_URL = get_server_url()
-logger.info(f"SERVER_URL: {SERVER_URL}")
 
 # Gemini model to use
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 
 def mcp_tool_to_genai_declaration(tool: mcp_types.Tool) -> types.FunctionDeclaration:
@@ -99,6 +106,21 @@ def mcp_tool_to_genai_declaration(tool: mcp_types.Tool) -> types.FunctionDeclara
 class MCPGenAIClient:
     """MCP Client that integrates with Google GenAI for chat functionality."""
 
+    # System prompt to guide Gemini on how to use tools
+    SYSTEM_PROMPT = """You are a helpful assistant with access to various tools including weather, time, and Google Calendar.
+
+IMPORTANT RULES FOR CALENDAR TOOLS:
+1. When user asks about calendar events (list, show, what's on my calendar, etc.), IMMEDIATELY call list_calendar_events tool. Do NOT ask for session_id - just call the tool with default parameters.
+2. When user wants to add/create an event, IMMEDIATELY call add_calendar_event tool with the event details. Do NOT ask for session_id.
+3. When user wants to delete an event, IMMEDIATELY call delete_calendar_event tool. Do NOT ask for session_id.
+4. The session_id parameter is AUTO-MANAGED. Leave it empty or omit it - the tool will handle authentication automatically.
+5. If the tool returns an authentication URL, show it to the user and ask them to complete the auth process.
+6. After user provides an auth code, call google_auth_submit with the session_id from the auth response and the code.
+
+NEVER ask the user for session_id. ALWAYS call the calendar tool directly and let the tool handle authentication.
+
+For weather and time tools, just call them directly with the requested parameters."""
+
     def __init__(self, server_url: str = SERVER_URL):
         self.server_url = server_url
         self.session: ClientSession | None = None
@@ -108,6 +130,28 @@ class MCPGenAIClient:
         self.prompts: list = []  # MCP prompts
         self.function_declarations: list[types.FunctionDeclaration] = []
         self.chat_history: list[types.Content] = []
+
+        # Add system prompt to chat history
+        self.chat_history.append(
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(
+                        text=f"System instructions: {self.SYSTEM_PROMPT}"
+                    )
+                ],
+            )
+        )
+        self.chat_history.append(
+            types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_text(
+                        text="Understood. I will call calendar tools directly without asking for session_id, and handle authentication automatically."
+                    )
+                ],
+            )
+        )
 
     async def initialize_genai(self):
         """Initialize the Google GenAI client."""
@@ -328,9 +372,6 @@ class MCPGenAIClient:
         print("  'quit'      - Exit")
         print("=" * 60 + "\n")
 
-        if self.session is None:
-            raise ValueError("Initialize first")
-
         while True:
             try:
                 user_input = input("\n👤 You: ").strip()
@@ -355,7 +396,7 @@ class MCPGenAIClient:
                             f"   • {resource.uri}: {resource.name or 'No description'}"
                         )
                     # Also show resource templates
-                    templates_response = await self.session.list_resource_templates()
+                    templates_response = await self.session.list_resource_templates()  # type: ignore
                     if templates_response.resourceTemplates:
                         print("\n📋 Resource Templates (dynamic):")
                         for template in templates_response.resourceTemplates:
@@ -378,7 +419,7 @@ class MCPGenAIClient:
                     try:
                         from pydantic import AnyUrl
 
-                        result = await self.session.read_resource(AnyUrl(uri))
+                        result = await self.session.read_resource(AnyUrl(uri))  # type: ignore
                         print(f"\n📖 Resource content ({uri}):")
                         for content in result.contents:
                             if hasattr(content, "text"):
@@ -410,7 +451,7 @@ class MCPGenAIClient:
                                 args[arg.name] = value
 
                     try:
-                        result = await self.session.get_prompt(
+                        result = await self.session.get_prompt(  # type: ignore
                             prompt_name, arguments=args
                         )
                         # Use the prompt content as the user message
@@ -486,7 +527,7 @@ def main():
     print(f"Model: {GEMINI_MODEL}")
     print(f"Server URL: {SERVER_URL}")
     print("\n⚠️  Make sure the server is running first!")
-    print("   Run: python server/http_server.py\n")
+    print("   Run: python servers/http_server.py\n")
 
     try:
         asyncio.run(run_client())
