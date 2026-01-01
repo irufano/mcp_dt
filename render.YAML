@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: mcp-calendar-server
+    name: dt-mcp-server
     runtime: python
     buildCommand: pip install uv && uv sync
     startCommand: uv run python server/http_server.py
