@@ -1,25 +1,19 @@
 """
-MCP Server with AUTO-AUTH for Google Calendar
+MCP Server with AUTO-AUTH Google Calendar (Browser Auto-Open)
 
 AUTOMATIC AUTHENTICATION:
-When user asks about calendar (list events, add event, etc.),
-the server automatically checks auth status and prompts for login if needed.
-
-NO session_id required in user prompts!
+When user asks about calendar, the server:
+1. Opens browser automatically for Google login
+2. Captures auth code via local callback server
+3. Returns to agent automatically - NO manual copy/paste!
 
 TOOLS:
 1. get_weather - Get weather for a city
-2. get_current_time - Get current time in a timezone
-3. list_calendar_events - List upcoming events (auto-auth)
+2. get_current_time - Get current time
+3. list_calendar_events - List events (auto-auth)
 4. add_calendar_event - Add event (auto-auth)
-5. google_auth_submit - Submit auth code (only when prompted)
-
-FLOW:
-1. User: "What's on my calendar?"
-2. Server: "🔐 Please authorize first: [URL]. Then call google_auth_submit with your code"
-3. User provides code
-4. Server: ✅ Connected! Here are your events...
-5. Future requests work automatically
+5. delete_calendar_event - Delete event (auto-auth)
+6. google_auth_submit - Manual auth code submission (fallback)
 
 Run: python servers/http_server.py
 """
@@ -28,8 +22,13 @@ import json
 import logging
 import os
 import secrets
+import socket
+import webbrowser
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Optional
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -60,40 +59,325 @@ mcp = FastMCP(name="mcp-calendar-server", host=HOST, port=PORT)
 
 # Google OAuth config
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"
+
+# Callback server port for OAuth (local only)
+OAUTH_CALLBACK_PORT = 8085
+OAUTH_CALLBACK_HOST = "localhost"
+
+
+# Check if running locally (can open browser) or in cloud
+def is_local_environment() -> bool:
+    """Check if running locally (can open browser) or in cloud."""
+    cloud_indicators = [
+        "RENDER",
+        "RAILWAY",
+        "HEROKU",
+        "AWS_LAMBDA_FUNCTION_NAME",
+        "GOOGLE_CLOUD_PROJECT",
+    ]
+    return not any(os.environ.get(var) for var in cloud_indicators)
+
+
+IS_LOCAL = is_local_environment()
+
+# Set redirect URI based on environment
+if IS_LOCAL:
+    REDIRECT_URI = f"http://{OAUTH_CALLBACK_HOST}:{OAUTH_CALLBACK_PORT}/callback"
+else:
+    REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"  # Manual copy-paste for cloud
 
 # =============================================================================
-# MULTI-USER SESSION STORAGE (In-Memory, keyed by connection)
+# OAUTH CALLBACK SERVER (Local Auto-Auth)
+# =============================================================================
+
+# Store for pending OAuth flows
+PENDING_AUTH: dict[str, dict] = {}
+
+
+class OAuthCallbackHandler(BaseHTTPRequestHandler):
+    """HTTP handler to capture OAuth callback."""
+
+    def log_message(self, format, *args):
+        """Suppress default logging."""
+        pass
+
+    def do_GET(self):
+        """Handle OAuth callback GET request."""
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/callback":
+            params = parse_qs(parsed.query)
+            code = params.get("code", [None])[0]
+            state = params.get("state", [None])[0]
+            error = params.get("error", [None])[0]
+
+            if error:
+                self.send_response(400)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    f"""
+                <html><body style="font-family: Arial; text-align: center; padding: 50px;">
+                <h1>❌ Authorization Failed</h1>
+                <p>Error: {error}</p>
+                <p>You can close this window.</p>
+                </body></html>
+                """.encode()
+                )
+                return
+
+            if code and state and state in PENDING_AUTH:
+                # Store the code for the session
+                PENDING_AUTH[state]["code"] = code
+                PENDING_AUTH[state]["completed"] = True
+
+                self.send_response(200)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    """
+                <html><body style="font-family: Arial; text-align: center; padding: 50px;">
+                <h1>DayaTech MCP Authorization Successful!</h1>
+                <p>You can close this window and return to the app.</p>
+                <script>setTimeout(() => window.close(), 2000);</script>
+                </body></html>
+                """.encode()
+                )
+                logger.info(f"OAuth callback received for state: {state[:8]}...")
+            else:
+                self.send_response(400)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(
+                    """
+                <html><body style="font-family: Arial; text-align: center; padding: 50px;">
+                <h1>❌ Invalid Request</h1>
+                <p>Missing or invalid authorization state.</p>
+                </body></html>
+                """.encode()
+                )
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def find_free_port(start_port: int = 8085, max_attempts: int = 10) -> int:
+    """Find a free port starting from start_port."""
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind((OAUTH_CALLBACK_HOST, port))
+                return port
+        except OSError:
+            continue
+    return start_port  # Fallback
+
+
+def start_oauth_callback_server(port: int, timeout: int = 120) -> Optional[HTTPServer]:
+    """Start a temporary HTTP server to capture OAuth callback."""
+    try:
+        server = HTTPServer((OAUTH_CALLBACK_HOST, port), OAuthCallbackHandler)
+        server.timeout = timeout
+        return server
+    except Exception as e:
+        logger.error(f"Failed to start OAuth callback server: {e}")
+        return None
+
+
+def auto_authenticate_local(session_id: str) -> str:
+    """Perform automatic OAuth flow with browser open (LOCAL ONLY).
+
+    1. Start local callback server
+    2. Open browser with auth URL
+    3. Wait for callback with code
+    4. Exchange code for tokens
+    5. Return success message
+    """
+    if not GOOGLE_CALENDAR_AVAILABLE:
+        return "❌ Google Calendar not available."
+
+    creds_file = (
+        CREDENTIALS_FILE if CREDENTIALS_FILE.exists() else Path("/tmp/credentials.json")
+    )
+    if not creds_file.exists():
+        return "❌ Google credentials not configured."
+
+    # Find free port and set redirect URI
+    port = find_free_port(OAUTH_CALLBACK_PORT)
+    redirect_uri = f"http://{OAUTH_CALLBACK_HOST}:{port}/callback"
+
+    try:
+        # Create OAuth flow with local redirect
+        flow = Flow.from_client_secrets_file(
+            str(creds_file), scopes=SCOPES, redirect_uri=redirect_uri
+        )
+
+        # Generate state for security
+        state = secrets.token_urlsafe(16)
+        auth_url, _ = flow.authorization_url(
+            access_type="offline", prompt="consent", state=state
+        )
+
+        # Store pending auth
+        PENDING_AUTH[state] = {
+            "flow": flow,
+            "session_id": session_id,
+            "code": None,
+            "completed": False,
+        }
+
+        # Start callback server in background
+        server = start_oauth_callback_server(port, timeout=120)
+        if not server:
+            return get_manual_auth_prompt(session_id)  # Fallback to manual
+
+        logger.info(f"Opening browser for OAuth (port {port})...")
+
+        # Open browser
+        webbrowser.open(auth_url)
+
+        # Wait for callback (with timeout)
+        import time
+
+        start_time = time.time()
+        timeout_seconds = 120
+
+        while time.time() - start_time < timeout_seconds:
+            server.handle_request()  # Handle one request
+
+            if PENDING_AUTH.get(state, {}).get("completed"):
+                break
+
+            time.sleep(0.1)
+
+        server.server_close()
+
+        # Check if we got the code
+        auth_data = PENDING_AUTH.get(state, {})
+        if not auth_data.get("code"):
+            del PENDING_AUTH[state]
+            return "❌ Authorization timed out. Please try again."
+
+        code = auth_data["code"]
+
+        # Exchange code for credentials
+        try:
+            flow.fetch_token(code=code)
+            credentials = flow.credentials
+
+            # Store in session
+            session = get_session(session_id)
+            session["credentials"] = credentials
+            session["pending_auth"] = None
+
+            # Get user email
+            service = build("calendar", "v3", credentials=credentials)
+            calendar = service.calendars().get(calendarId="primary").execute()
+            email = calendar.get("summary", "Your Calendar")
+            session["email"] = email
+
+            # Cleanup
+            del PENDING_AUTH[state]
+
+            logger.info(f"Auto-auth successful: {email}")
+
+            return f"""✅ **Successfully Connected!**
+
+📧 Calendar: {email}
+🔑 Session ID: `{session_id}`
+
+Your Google Calendar is now connected. What would you like to do?
+• List your upcoming events
+• Add a new event
+• Check today's schedule"""
+
+        except Exception as e:
+            logger.error(f"Token exchange failed: {e}")
+            del PENDING_AUTH[state]
+            return f"❌ Authorization failed: {e}"
+
+    except Exception as e:
+        logger.error(f"Auto-auth failed: {e}")
+        return get_manual_auth_prompt(session_id)  # Fallback to manual
+
+
+def get_manual_auth_prompt(session_id: str) -> str:
+    """Generate manual auth prompt (for cloud or fallback)."""
+    creds_file = (
+        CREDENTIALS_FILE if CREDENTIALS_FILE.exists() else Path("/tmp/credentials.json")
+    )
+
+    try:
+        flow = Flow.from_client_secrets_file(
+            str(creds_file), scopes=SCOPES, redirect_uri="urn:ietf:wg:oauth:2.0:oob"
+        )
+        auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
+
+        session = get_session(session_id)
+        session["pending_auth"] = flow
+
+        return f"""🔐 **Google Calendar Authorization Required**
+
+**Step 1:** Open this URL in your browser:
+{auth_url}
+
+**Step 2:** Log into your Google account and grant permission
+
+**Step 3:** Copy the authorization code shown
+
+**Step 4:** Submit the code:
+```
+google_auth_submit(session_id="{session_id}", code="YOUR_CODE_HERE")
+```
+
+📌 **Your Session ID:** `{session_id}`"""
+
+    except Exception as e:
+        return f"❌ Failed to create auth flow: {e}"
+
+
+def get_auth_prompt(session_id: Optional[str] = None) -> str:
+    """Get auth prompt - auto-opens browser locally, manual prompt for cloud."""
+    if not GOOGLE_CALENDAR_AVAILABLE:
+        return "❌ Google Calendar not available. Install required packages."
+
+    # Ensure credentials file exists
+    if not CREDENTIALS_FILE.exists():
+        env_var = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        if env_var:
+            try:
+                Path("/tmp/credentials.json").write_text(env_var)
+            except:  # noqa: E722
+                pass
+
+        if not CREDENTIALS_FILE.exists() and not Path("/tmp/credentials.json").exists():
+            return "❌ Google credentials not configured on server."
+
+    # Generate session ID if not provided
+    if not session_id:
+        session_id = secrets.token_urlsafe(16)
+
+    # Local: Auto-open browser and capture code
+    if IS_LOCAL:
+        return auto_authenticate_local(session_id)
+
+    # Cloud: Return manual prompt
+    return get_manual_auth_prompt(session_id)
+
+
+# =============================================================================
+# MULTI-USER SESSION STORAGE
 # =============================================================================
 
 # Store credentials per user session in memory
-# Key: session_id (from MCP context or generated), Value: session data
 USER_SESSIONS: dict[str, dict] = {}
-
-# Session timeout (hours) - clean up old sessions
 SESSION_TIMEOUT_HOURS = 24
 
 
-def get_session_id_from_context() -> str:
-    """Get or create a session ID.
-
-    In a real MCP deployment, this could come from:
-    - HTTP headers (X-Session-ID)
-    - MCP client session
-    - Cookie
-
-    For now, we use a simple approach with a default session
-    that can be overridden by the user.
-    """
-    # You can enhance this to extract from MCP request context
-    # For HTTP transport, you might use request headers
-    return "default"
-
-
-def get_session(session_id: str = None) -> dict:  # type: ignore
+def get_session(session_id: Optional[str] = None) -> dict:
     """Get or create a user session."""
     if session_id is None:
-        session_id = get_session_id_from_context()
+        session_id = "default"
 
     if session_id not in USER_SESSIONS:
         USER_SESSIONS[session_id] = {
@@ -120,7 +404,6 @@ def cleanup_old_sessions():
     ]
     for sid in expired:
         del USER_SESSIONS[sid]
-        logger.info(f"Cleaned up expired session: {sid[:8]}...")
 
 
 def get_user_count() -> int:
@@ -148,7 +431,7 @@ def get_credentials_path() -> Path:
 CREDENTIALS_FILE = get_credentials_path()
 
 
-def get_calendar_service(session_id: str = None):  # type: ignore
+def get_calendar_service(session_id: Optional[str] = None):
     """Get Google Calendar service if authenticated."""
     if not GOOGLE_CALENDAR_AVAILABLE:
         return None
@@ -176,65 +459,61 @@ def get_calendar_service(session_id: str = None):  # type: ignore
         return None
 
 
-def is_authenticated(session_id: str = None) -> bool:  # type: ignore
+def is_authenticated(session_id: Optional[str] = None) -> bool:
     """Check if user is authenticated."""
     session = get_session(session_id)
     return session.get("credentials") is not None
 
 
-def get_auth_prompt(session_id: str = None) -> str:  # type: ignore
-    """Generate auth URL and return prompt for user."""
-    if not GOOGLE_CALENDAR_AVAILABLE:
-        return "❌ Google Calendar not available. Install required packages."
+# def get_auth_prompt(session_id: str = None) -> str:
+#     """Generate auth URL and return prompt for user."""
+#     if not GOOGLE_CALENDAR_AVAILABLE:
+#         return "❌ Google Calendar not available. Install required packages."
 
-    if not CREDENTIALS_FILE.exists():
-        env_var = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-        if env_var:
-            try:
-                Path("/tmp/credentials.json").write_text(env_var)
-            except:  # noqa: E722
-                pass
+#     if not CREDENTIALS_FILE.exists():
+#         env_var = os.environ.get('GOOGLE_CREDENTIALS_JSON')
+#         if env_var:
+#             try:
+#                 Path('/tmp/credentials.json').write_text(env_var)
+#             except:
+#                 pass
 
-        if not CREDENTIALS_FILE.exists() and not Path("/tmp/credentials.json").exists():
-            return "❌ Google credentials not configured on server."
+#         if not CREDENTIALS_FILE.exists() and not Path('/tmp/credentials.json').exists():
+#             return "❌ Google credentials not configured on server."
 
-    creds_file = (
-        CREDENTIALS_FILE if CREDENTIALS_FILE.exists() else Path("/tmp/credentials.json")
-    )
+#     creds_file = CREDENTIALS_FILE if CREDENTIALS_FILE.exists() else Path('/tmp/credentials.json')
 
-    try:
-        flow = Flow.from_client_secrets_file(
-            str(creds_file), scopes=SCOPES, redirect_uri=REDIRECT_URI
-        )
-        auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
+#     try:
+#         flow = Flow.from_client_secrets_file(str(creds_file), scopes=SCOPES, redirect_uri=REDIRECT_URI)
+#         auth_url, _ = flow.authorization_url(access_type='offline', prompt='consent')
 
-        # Generate unique session ID for this auth flow
-        new_session_id = secrets.token_urlsafe(16)
-        session = get_session(new_session_id)
-        session["pending_auth"] = flow
+#         # Generate unique session ID for this auth flow
+#         new_session_id = secrets.token_urlsafe(16)
+#         session = get_session(new_session_id)
+#         session['pending_auth'] = flow
 
-        return f"""🔐 **Google Calendar Authorization Required**
+#         return f"""🔐 **Google Calendar Authorization Required**
 
-To access your calendar, please:
+# To access your calendar, please:
 
-**Step 1:** Open this URL in your browser:
-{auth_url}
+# **Step 1:** Open this URL in your browser:
+# {auth_url}
 
-**Step 2:** Log into your Google account and grant permission
+# **Step 2:** Log into your Google account and grant permission
 
-**Step 3:** Copy the authorization code shown
+# **Step 3:** Copy the authorization code shown
 
-**Step 4:** Submit the code with your session ID:
-```
-google_auth_submit(session_id="{new_session_id}", code="YOUR_CODE_HERE")
-```
+# **Step 4:** Submit the code with your session ID:
+# ```
+# google_auth_submit(session_id="{new_session_id}", code="YOUR_CODE_HERE")
+# ```
 
-📌 **Your Session ID:** `{new_session_id}`
-(Save this - you'll need it to complete authentication!)"""
+# 📌 **Your Session ID:** `{new_session_id}`
+# (Save this - you'll need it to complete authentication!)"""
 
-    except Exception as e:
-        logger.error(f"Failed to create auth flow: {e}")
-        return f"❌ Failed to start authentication: {e}"
+#     except Exception as e:
+#         logger.error(f"Failed to create auth flow: {e}")
+#         return f"❌ Failed to start authentication: {e}"
 
 
 # =============================================================================
