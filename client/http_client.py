@@ -19,6 +19,7 @@ Run with:
 import asyncio
 import logging
 import os
+import sys
 from typing import Any
 
 from dotenv import load_dotenv
@@ -38,8 +39,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mcp-genai-http-client")
 
-# Server URL - must match where the HTTP server is running
-SERVER_URL = "http://localhost:8000/mcp"
+# Server URL - from command line, environment, or default
+def get_server_url() -> str:
+    # 1. Command line argument
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    # 2. Environment variable
+    if os.environ.get("MCP_SERVER_URL"):
+        return os.environ["MCP_SERVER_URL"]
+    # 3. Default local
+    return "http://localhost:8000/mcp"
+
+SERVER_URL = get_server_url()
+logger.info(f"SERVER_URL: {SERVER_URL}")
 
 # Gemini model to use
 GEMINI_MODEL = "gemini-2.5-flash"
@@ -474,7 +486,7 @@ def main():
     print(f"Model: {GEMINI_MODEL}")
     print(f"Server URL: {SERVER_URL}")
     print("\n⚠️  Make sure the server is running first!")
-    print("   Run: python servers/http_server.py\n")
+    print("   Run: python server/http_server.py\n")
 
     try:
         asyncio.run(run_client())

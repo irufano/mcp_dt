@@ -63,8 +63,59 @@ mcp = FastMCP(name="mcp-multiuser-calendar", host=HOST, port=PORT)
 
 # Google OAuth config
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-CREDENTIALS_FILE = Path(__file__).parent.parent / "credentials.json"
 REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"  # Manual code copy-paste
+
+
+def get_credentials_path() -> Path:
+    """Get credentials from environment variable or local file."""
+    # Check for environment variable first (for Render/cloud deployment)
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if creds_json:
+        # Write to temp file for Google OAuth library
+        temp_path = Path("/tmp/credentials.json")
+        try:
+            temp_path.write_text(creds_json)
+            logger.info("Using GOOGLE_CREDENTIALS_JSON from environment")
+            return temp_path
+        except Exception as e:
+            logger.error(f"Failed to write credentials to temp file: {e}")
+
+    # Fall back to local file
+    local_path = Path(__file__).parent.parent / "credentials.json"
+    if local_path.exists():
+        logger.info(f"Using credentials from {local_path}")
+    else:
+        logger.warning(f"No credentials found at {local_path}")
+    return local_path
+
+
+def ensure_credentials_file() -> Path:
+    """Ensure credentials file exists, creating from env var if needed."""
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    temp_path = Path("/tmp/credentials.json")
+
+    # If env var exists, always write it (might be updated)
+    if creds_json:
+        try:
+            temp_path.write_text(creds_json)
+            logger.info(
+                "Wrote credentials from GOOGLE_CREDENTIALS_JSON to /tmp/credentials.json"
+            )
+            return temp_path
+        except Exception as e:
+            logger.error(f"Failed to write credentials: {e}")
+
+    # Check if temp file already exists
+    if temp_path.exists():
+        return temp_path
+
+    # Fall back to local file
+    local_path = Path(__file__).parent.parent / "credentials.json"
+    return local_path
+
+
+# Initialize at module load
+CREDENTIALS_FILE = get_credentials_path()
 
 # Session storage
 USER_SESSIONS: dict[str, dict] = {}
@@ -207,12 +258,29 @@ def google_auth_start() -> str:
     if not GOOGLE_CALENDAR_AVAILABLE:
         return "❌ Google Calendar not available. Install: pip install google-auth google-auth-oauthlib google-api-python-client"
 
-    if not CREDENTIALS_FILE.exists():
-        return f"❌ credentials.json not found at {CREDENTIALS_FILE}"
+    # Get credentials (from env var or file)
+    creds_file = ensure_credentials_file()
+
+    if not creds_file.exists():
+        # Check if env var is set but maybe malformed
+        env_var = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        if env_var:
+            return f"""❌ GOOGLE_CREDENTIALS_JSON is set but failed to create credentials file.
+
+Check that the environment variable contains valid JSON.
+First 100 chars: {env_var[:100]}..."""
+        else:
+            return """❌ Google credentials not found.
+
+For local development:
+  Place credentials.json in the project root.
+
+For Render/cloud deployment:
+  Set GOOGLE_CREDENTIALS_JSON environment variable with the contents of credentials.json."""
 
     try:
         flow = Flow.from_client_secrets_file(
-            str(CREDENTIALS_FILE), scopes=SCOPES, redirect_uri=REDIRECT_URI
+            str(creds_file), scopes=SCOPES, redirect_uri=REDIRECT_URI
         )
         auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
         session_id = generate_session_id()
@@ -249,9 +317,14 @@ def google_auth_callback(session_id: str, code: str) -> str:
     if not GOOGLE_CALENDAR_AVAILABLE:
         return "❌ Google Calendar not available"
 
+    # Get credentials file
+    creds_file = ensure_credentials_file()
+    if not creds_file.exists():
+        return "❌ Credentials not found. Call google_auth_start first."
+
     try:
         flow = Flow.from_client_secrets_file(
-            str(CREDENTIALS_FILE), scopes=SCOPES, redirect_uri=REDIRECT_URI
+            str(creds_file), scopes=SCOPES, redirect_uri=REDIRECT_URI
         )
         flow.fetch_token(code=code)
         credentials = flow.credentials
@@ -407,7 +480,7 @@ def add_calendar_event(
         if location:
             event["location"] = location
         if attendees:
-            event["attendees"] = [ # type: ignore
+            event["attendees"] = [  # type: ignore
                 {"email": e.strip()} for e in attendees.split(",") if e.strip()
             ]
 
