@@ -3,7 +3,7 @@ services:
     name: dt-mcp-server
     runtime: python
     buildCommand: pip install uv && uv pip install -r requirements.txt --system
-    startCommand: python servers/http_server.py
+    startCommand: python http_server.py
     envVars:
       - key: GOOGLE_CREDENTIALS_JSON
         sync: false
