@@ -1,24 +1,29 @@
 """
 MCP Server with Multi-User OAuth - Automatic Callback (Cloud-Ready)
 
+Added /callback route using FastMCP's @custom_route decorator
+This ensures the callback works in cloud deployment (Render, Railway, etc.)
+
+API:
+https://open-meteo.com/
+
+
 AUTOMATIC AUTHENTICATION:
 - OAuth callback automatically completes authentication
 - No manual session ID copy-paste required
 - Works on both local and cloud environments
 
 STORAGE MODES:
-- Local: File-based token storage (persistent across restarts)
-- Cloud/Render Free: In-memory storage (no disk required!)
-- Redis (optional): Set REDIS_URL for cloud persistence
+- In-memory storage (no disk required!)
 
 SUPPORTED ENVIRONMENTS:
 1. Local Development (VSCode, Claude Code):
-   - Callback: http://localhost:8085/callback
+   - Callback: http://localhost:8085/callback (separate server)
    - Browser opens automatically
-   - Tokens saved to disk
+   - In-memory token storage (works without disk!)
 
 2. Cloud Deployment (Render Free Tier, Railway, Fly.io):
-   - Callback: https://your-domain.com/callback
+   - Callback: https://your-domain.com/callback (same server via custom_route)
    - In-memory token storage (works without disk!)
    - Tokens persist during server uptime
    - Set CALLBACK_URL environment variable
@@ -37,24 +42,25 @@ import json
 import logging
 import os
 import secrets
-import socket
 import threading
 import time
 import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
-from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
+from geopy.geocoders import Nominatim
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from timezonefinder import TimezoneFinder
 
 # Google Calendar imports
 try:
-    from google.auth.transport.requests import Request
+    from google.auth.transport.requests import Request as GoogleRequest
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import Flow
     from googleapiclient.discovery import build
@@ -70,15 +76,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mcp-server")
 
-# =============================================================================
+# ---------
 # CONFIGURATION
-# =============================================================================
+# ---------
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", 8000))
+VERSION = os.environ.get("VERSION", "0.0.1")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-CALLBACK_PORT = int(os.environ.get("CALLBACK_PORT", 8085))
-REDIS_URL = os.environ.get("REDIS_URL")  # Optional Redis for persistence
 
 # Environment detection
 IS_CLOUD = bool(
@@ -100,13 +105,7 @@ def get_callback_url() -> str:
     """Get the callback URL based on environment."""
     if os.environ.get("CALLBACK_URL"):
         return os.environ["CALLBACK_URL"]
-    if os.environ.get("RENDER_EXTERNAL_URL"):
-        return f"{os.environ['RENDER_EXTERNAL_URL']}/callback"
-    if os.environ.get("RAILWAY_STATIC_URL"):
-        return f"https://{os.environ['RAILWAY_STATIC_URL']}/callback"
-    if os.environ.get("FLY_APP_NAME"):
-        return f"https://{os.environ['FLY_APP_NAME']}.fly.dev/callback"
-    return f"http://localhost:{CALLBACK_PORT}/callback"
+    return f"http://localhost:{PORT}/callback"
 
 
 CALLBACK_URL = get_callback_url()
@@ -137,9 +136,9 @@ def get_credentials_file() -> Path:
 CREDENTIALS_FILE = get_credentials_file()
 
 
-# =============================================================================
-# TOKEN STORAGE (Memory / File / Redis)
-# =============================================================================
+# ---------
+# TOKEN STORAGE (Memory)
+# ---------
 
 
 class TokenStorage:
@@ -198,9 +197,9 @@ def create_token_storage() -> TokenStorage:
 token_storage = create_token_storage()
 
 
-# =============================================================================
+# ---------
 # USER SESSION WITH AUTO-CALLBACK
-# =============================================================================
+# ---------
 
 
 @dataclass
@@ -221,7 +220,7 @@ class UserSession:
             return False
         if self.credentials.expired and self.credentials.refresh_token:
             try:
-                self.credentials.refresh(Request())
+                self.credentials.refresh(GoogleRequest())
                 self.save_token()
             except Exception:
                 return False
@@ -260,7 +259,7 @@ class UserSession:
             self.email = data.get("email")
 
             if self.credentials.expired and self.credentials.refresh_token:
-                self.credentials.refresh(Request())
+                self.credentials.refresh(GoogleRequest())
                 self.save_token()
 
             logger.info(f"Loaded token for {self.email}")
@@ -339,146 +338,14 @@ class SessionManager:
 session_manager = SessionManager()
 
 
-# =============================================================================
-# OAUTH CALLBACK HANDLER
-# =============================================================================
+# ---------
+# OAUTH CALLBACK - FASTMCP CUSTOM ROUTES
+# ---------
 
 
-class OAuthCallbackHandler(BaseHTTPRequestHandler):
-    """HTTP handler for OAuth callbacks - auto-completes authentication."""
-
-    def log_message(self, *args):
-        pass
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-
-        if parsed.path == "/callback":
-            self._handle_oauth_callback(parsed)
-        elif parsed.path == "/health":
-            self._send_text(200, "OK")
-        elif parsed.path == "/auth/check":
-            self._handle_auth_check(parsed)
-        else:
-            self._send_text(404, "Not Found")
-
-    def _handle_oauth_callback(self, parsed):
-        """Handle OAuth callback - automatically complete auth."""
-        params = parse_qs(parsed.query)
-        code = params.get("code", [None])[0]
-        state = params.get("state", [None])[0]
-        error = params.get("error", [None])[0]
-
-        if error:
-            session = session_manager.get_session_by_state(state) if state else None
-            if session:
-                session.auth_error = error
-                session.auth_completed = True
-
-            self._send_html(
-                400,
-                f"""
-                <h1>❌ Authorization Failed</h1>
-                <p>Error: {error}</p>
-                <p>{params.get("error_description", [""])[0]}</p>
-                <p>You can close this window.</p>
-            """,
-            )
-            return
-
-        if not code or not state:
-            self._send_html(400, "<h1>❌ Invalid callback</h1>")
-            return
-
-        session = session_manager.get_session_by_state(state)
-        if not session or not session.pending_auth:
-            self._send_html(400, "<h1>❌ Session expired</h1><p>Please try again.</p>")
-            return
-
-        try:
-            flow = session.pending_auth.get("flow")
-            if not flow:
-                raise ValueError("No OAuth flow")
-
-            # Exchange code for tokens
-            flow.fetch_token(code=code)
-            session.credentials = flow.credentials
-
-            # Get user email
-            service = build("calendar", "v3", credentials=session.credentials)
-            calendar = service.calendars().get(calendarId="primary").execute()
-            session.email = calendar.get("summary", "Unknown")
-
-            # Save and mark complete
-            session.save_token()
-            session.pending_auth = None
-            session.auth_completed = True
-            session.auth_error = None
-
-            session_manager.cleanup_auth_state(state)
-
-            logger.info(f"✅ OAuth complete for {session.email}")
-
-            self._send_html(
-                200,
-                f"""
-                <h1>✅ Authorization Successful!</h1>
-                <p>Welcome, <strong>{session.email}</strong>!</p>
-                <p>You can close this window and return to your application.</p>
-                <p>Your calendar is now connected.</p>
-                <p style="color: #666; font-size: 0.9em;">
-                    Storage mode: {STORAGE_MODE}
-                </p>
-                <script>
-                    setTimeout(() => {{
-                        window.close();
-                    }}, 2000);
-                </script>
-            """,
-            )
-
-        except Exception as e:
-            logger.error(f"Callback error: {e}")
-            session.auth_error = str(e)
-            session.auth_completed = True
-            self._send_html(500, f"<h1>❌ Error</h1><p>{e}</p>")
-
-    def _handle_auth_check(self, parsed):
-        """Check auth status for polling."""
-        params = parse_qs(parsed.query)
-        user_id = params.get("user_id", [None])[0]
-
-        if not user_id:
-            self._send_json(400, {"error": "Missing user_id"})
-            return
-
-        session = session_manager.get_session_by_user(user_id)
-        if not session:
-            self._send_json(404, {"authenticated": False, "pending": False})
-            return
-
-        self._send_json(
-            200,
-            {
-                "authenticated": session.is_authenticated(),
-                "pending": session.pending_auth is not None,
-                "completed": session.auth_completed,
-                "email": session.email,
-                "error": session.auth_error,
-            },
-        )
-
-    def _send_text(self, code: int, text: str):
-        self.send_response(code)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(text.encode())
-
-    def _send_html(self, code: int, body: str):
-        self.send_response(code)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-        html = f"""<!DOCTYPE html>
+def make_html_response(code: int, body: str) -> HTMLResponse:
+    """Create HTML response with styling."""
+    html = f"""<!DOCTYPE html>
 <html><head><title>MCP OAuth</title>
 <style>
 body {{ font-family: -apple-system, system-ui, sans-serif; 
@@ -486,59 +353,156 @@ body {{ font-family: -apple-system, system-ui, sans-serif;
 h1 {{ color: #333; }}
 </style></head>
 <body>{body}</body></html>"""
-        self.wfile.write(html.encode())
-
-    def _send_json(self, code: int, data: dict):
-        self.send_response(code)
-        self.send_header("Content-type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+    return HTMLResponse(content=html, status_code=code)
 
 
-def find_free_port(start: int = 8085) -> int:
-    for port in range(start, start + 10):
-        try:
-            with socket.socket() as s:
-                s.bind(("localhost", port))
-                return port
-        except OSError:
-            continue
-    return start
+@mcp.custom_route("/callback", methods=["GET"])
+async def handle_oauth_callback(request: Request) -> Response:
+    """Handle OAuth callback - automatically complete auth (CLOUD MODE)."""
+    params = dict(request.query_params)
+    code = params.get("code")
+    state = params.get("state")
+    error = params.get("error")
+
+    logger.info(
+        f"OAuth callback received - state: {state[:16] if state else 'None'}..."
+    )
+
+    if error:
+        session = session_manager.get_session_by_state(state) if state else None
+        if session:
+            session.auth_error = error
+            session.auth_completed = True
+
+        return make_html_response(
+            400,
+            f"""
+            <h1>Authorization Failed</h1>
+            <p>Error: {error}</p>
+            <p>{params.get("error_description", "")}</p>
+            <p>You can close this window.</p>
+        """,
+        )
+
+    if not code or not state:
+        return make_html_response(
+            400, "<h1>Invalid callback</h1><p>Missing code or state parameter.</p>"
+        )
+
+    session = session_manager.get_session_by_state(state)
+    if not session:
+        logger.error(f"No session found for state: {state[:16]}...")
+        return make_html_response(
+            400,
+            "<h1>Session expired or not found</h1><p>Please try authenticating again.</p>",
+        )
+
+    if not session.pending_auth:
+        logger.error(f"No pending auth for session: {session.session_id[:8]}...")
+        return make_html_response(
+            400,
+            "<h1>No pending authentication</h1><p>Please start authentication again.</p>",
+        )
+
+    try:
+        flow = session.pending_auth.get("flow")
+        if not flow:
+            raise ValueError("No OAuth flow found in session")
+
+        # Exchange code for tokens
+        logger.info("Exchanging authorization code for tokens...")
+        flow.fetch_token(code=code)
+        session.credentials = flow.credentials
+
+        # Get user email
+        service = build("calendar", "v3", credentials=session.credentials)
+        calendar = service.calendars().get(calendarId="primary").execute()
+        session.email = calendar.get("summary", "Unknown")
+
+        # Save and mark complete
+        session.save_token()
+        session.pending_auth = None
+        session.auth_completed = True
+        session.auth_error = None
+
+        session_manager.cleanup_auth_state(state)
+
+        logger.info(f"OAuth complete for {session.email}")
+
+        return make_html_response(
+            200,
+            f"""
+            <h1>DayaTech MCP Authorization Successful!</h1>
+            <p>Welcome, <strong>{session.email}</strong>!</p>
+            <p>You can close this window and return to your application.</p>
+            <p>Your calendar is now connected.</p>
+            <script>
+                setTimeout(() => {{
+                    window.close();
+                }}, 2000);
+            </script>
+        """,
+        )
+
+    except Exception as e:
+        logger.error(f"Callback error: {e}")
+        session.auth_error = str(e)
+        session.auth_completed = True
+        return make_html_response(500, f"<h1>Error</h1><p>{e}</p>")
 
 
-# Global callback server
-_callback_server: Optional[HTTPServer] = None
-_callback_thread: Optional[threading.Thread] = None
+@mcp.custom_route("/health", methods=["GET"])
+async def handle_health(request: Request) -> Response:
+    """Health check endpoint."""
+    return PlainTextResponse("OK")
 
 
-def start_callback_server():
-    """Start callback server for OAuth."""
-    global _callback_server, _callback_thread, CALLBACK_PORT
+@mcp.custom_route("/auth/check", methods=["GET"])
+async def handle_auth_check(request: Request) -> Response:
+    """Check auth status for polling."""
+    user_id = request.query_params.get("user_id")
 
-    if _callback_server:
-        return
+    if not user_id:
+        return JSONResponse({"error": "Missing user_id"}, status_code=400)
 
-    if IS_CLOUD:
-        logger.info("Cloud mode - callback handled by main server or external URL")
-        return
+    session = session_manager.get_session_by_user(user_id)
+    if not session:
+        return JSONResponse({"authenticated": False, "pending": False}, status_code=404)
 
-    port = find_free_port(CALLBACK_PORT)
-    CALLBACK_PORT = port
-
-    _callback_server = HTTPServer(("0.0.0.0", port), OAuthCallbackHandler)
-
-    def serve():
-        logger.info(f"Callback server on port {port}")
-        _callback_server.serve_forever()  # type: ignore
-
-    _callback_thread = threading.Thread(target=serve, daemon=True)
-    _callback_thread.start()
+    return JSONResponse(
+        {
+            "authenticated": session.is_authenticated(),
+            "pending": session.pending_auth is not None,
+            "completed": session.auth_completed,
+            "email": session.email,
+            "error": session.auth_error,
+        }
+    )
 
 
-# =============================================================================
+@mcp.custom_route("/", methods=["GET"])
+async def handle_root(request: Request) -> Response:
+    """Root endpoint with server info."""
+    return JSONResponse(
+        {
+            "name": "DayaTech MCP Server",
+            "version": "0.0.1",
+            "is_cloud": IS_CLOUD,
+            "callback_url": CALLBACK_URL,
+            "storage_mode": STORAGE_MODE,
+            "endpoints": {
+                "mcp": "/mcp",
+                "callback": "/callback",
+                "health": "/health",
+                "auth_check": "/auth/check",
+            },
+        }
+    )
+
+
+# ---------
 # AUTHENTICATION FLOW
-# =============================================================================
+# ---------
 
 
 def start_oauth_flow(user_id: str, open_browser: bool = True) -> dict:
@@ -564,9 +528,10 @@ def start_oauth_flow(user_id: str, open_browser: bool = True) -> dict:
         }
 
     try:
+        # use the main server's /callback route
         callback_url = CALLBACK_URL
-        if not IS_CLOUD:
-            callback_url = f"http://localhost:{CALLBACK_PORT}/callback"
+
+        logger.info(f"Starting OAuth flow with callback: {callback_url}")
 
         flow = Flow.from_client_secrets_file(
             str(CREDENTIALS_FILE), scopes=SCOPES, redirect_uri=callback_url
@@ -589,9 +554,12 @@ def start_oauth_flow(user_id: str, open_browser: bool = True) -> dict:
         session.auth_error = None
 
         session_manager.register_auth_state(state, session.session_id)
+        logger.info(
+            f"Registered auth state: {state[:16]}... -> session {session.session_id[:8]}..."
+        )
 
-        # Open browser for local development
-        if open_browser and not IS_CLOUD:
+        # Open browser
+        if open_browser:
             try:
                 webbrowser.open(auth_url)
                 logger.info("Browser opened for authentication")
@@ -641,9 +609,9 @@ def wait_for_oauth(user_id: str, timeout: int = 120) -> dict:
     return {"success": False, "error": "Authentication timed out"}
 
 
-# =============================================================================
+# ---------
 # WEATHER HELPERS
-# =============================================================================
+# ---------
 
 
 async def get_coordinates(city: str) -> dict | None:
@@ -686,9 +654,48 @@ async def fetch_weather(lat: float, lon: float) -> dict | None:
     return None
 
 
-# =============================================================================
+# ---------
+# DAYAAWAY HELPERS
+# ---------
+
+
+async def fetch_employee() -> dict | None:
+    url = "https://script.googleusercontent.com/macros/echo?user_content_key=AehSKLhnfPHRcF-ABZF8yYQ5SSHe2mKdPSWsoV6RjMz14KhdvNIBQ2zqxtwMIiMCFz3aqp3DPNRCtfoWhkpoxh2133fbvypLT460l9HY2hVY-YGMt39ZByDEt5fL5sbp6R5idJhOh0czcbgrDWMouTGQjJ3NcRPwNXDvXhjJZh-aSwkJa1IGwp52mYtB2T059H0DnbfcjR4kNTJ53kBF7NypQmdGONpwGkKHzbEmZ_EVPfnxm8vk81Br-7sfl-YRqYsS4OM_EtftRqAHPqAIemGU94tmKHvbzXeXbJew66NGbcwG5hY6eyIE0Jj0r-Yrd1-jObsouUjv59uLCowqDak&lib=MccofaXFiKY93gvVI0QdCdHoCq6hyld7b"
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+    }
+    async with httpx.AsyncClient(follow_redirects=True, max_redirects=10) as client:
+        try:
+            resp = await client.get(
+                url,
+                headers=headers,
+                timeout=15.0,
+            )
+            return json.loads(resp.text)
+        except Exception:
+            return None
+
+
+async def fetch_onleave_employee() -> dict | None:
+    url = "https://script.googleusercontent.com/macros/echo?user_content_key=AehSKLgarGzN7GaLXxKiuYiDofl2W-yey7EoeYfrLlgwkCgTafasgxQCWJd-F3e8SRYW-6PAOMtIctRKbB1Dd49xw40q69KgMg_mPf9V2Vrxee3yQzwHqMtrGqK6nIolps1X2-wfq_FeeFr-uTwKDbCuvsBjgmg2BgIKIL9cLYF_O3fG4mSPr-Uqrw-m2Pe5-HJ2W-GSn3Zi6f1VZf1aRDJnQ43WeGxtWPRhLJcjk5RVbh3wHovwI9JcpYTOqTU34IHlwRnvQFDUfisAxVMPMC0xS0QqXXHGtZJtvswggq9LMeSHPaqoLTmBPhhIR-K0d2Q26ksNnVCZ19E5lrwJQgY&lib=MccofaXFiKY93gvVI0QdCdHoCq6hyld7b"
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+    }
+    async with httpx.AsyncClient(follow_redirects=True, max_redirects=10) as client:
+        try:
+            resp = await client.get(
+                url,
+                headers=headers,
+                timeout=15.0,
+            )
+            return json.loads(resp.text)
+        except Exception:
+            return None
+
+
+# ---------
 # MCP TOOLS
-# =============================================================================
+# ---------
 
 
 @mcp.tool()
@@ -727,143 +734,151 @@ async def get_weather(city: str, country: str | None = None) -> str:
 
 
 @mcp.tool()
-def get_current_time(timezone: str = "UTC") -> str:
-    """Get current date and time.
+def get_current_time(city: str) -> str:
+    """Get current date and time by city name.
 
     Args:
-        timezone: Timezone (e.g., "UTC", "Asia/Jakarta", "US/Eastern")
+        city: City name (e.g., "Tokyo", "London", "Jakarta", "Bandung")
     """
     try:
-        now = datetime.now(ZoneInfo(timezone))
-        return f"""🕐 Current Time ({timezone}):
-• Date: {now.strftime("%A, %B %d, %Y")}
-• Time: {now.strftime("%I:%M:%S %p")}
-• ISO: {now.isoformat()}"""
-    except Exception:
-        now = datetime.now(ZoneInfo("UTC"))
-        return f"⚠️ Invalid timezone. UTC: {now.isoformat()}"
+        geolocator = Nominatim(user_agent="city_time_lookup")
+        tf = TimezoneFinder()
+
+        location = geolocator.geocode(city)
+        if not location:
+            return f"⚠️ City '{city}' not found. Please check the spelling."
+
+        timezone_str = tf.timezone_at(lng=location.longitude, lat=location.latitude)  # type: ignore
+
+        if not timezone_str:
+            return f"⚠️ Could not determine the timezone for '{city}'."
+
+        tz = ZoneInfo(timezone_str)
+        now = datetime.now(tz)
+        return f"🕐 Current time in {city}: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+
+    except Exception as e:
+        return f"❌ Error: {e}"
 
 
 @mcp.tool()
-def connect_google_calendar(user_id: str, wait: bool = True, timeout: int = 120) -> str:
-    """Connect to Google Calendar with automatic OAuth.
+async def get_dayatech_employee() -> str:
+    """Get dayatech employee."""
 
-    Opens browser for authentication and waits for completion.
-    The callback automatically handles the OAuth response.
+    employee = await fetch_employee()
+
+    if not employee:
+        return "❌ Could not fetch employee"
+
+    employee_data = employee.get("data", [])
+
+    result = "\n".join(
+        f"{i['emp_id']} | {i['nama']} | {i['tim']}" for i in employee_data
+    )
+
+    return result
+
+
+@mcp.tool()
+async def get_dayatech_on_leave_employee() -> str:
+    """Get dayatech on leave employee."""
+
+    employee = await fetch_onleave_employee()
+
+    if not employee:
+        return "❌ Could not fetch on leave employee"
+
+    total_onleave = employee.get("cuti", 0)
+    total_permit = employee.get("izin", 0)
+    employee_data = employee.get("rows", [])
+
+    employee_leaves = "\n".join(
+        f"- {i['nama']} | {i['tim']} | {i['jenis']} | {i['keterangan']} | {i['tanggal']} "
+        for i in employee_data
+    )
+
+    result = f"""- Total on leave: {total_onleave}
+- Total on izin: {total_permit}
+
+Employee:
+{employee_leaves}
+"""
+    return result
+
+
+@mcp.tool()
+def connect_google_calendar(user_id: str) -> str:
+    """Connect to Google Calendar via OAuth.
 
     Args:
-        user_id: Unique identifier for this user/conversation
-        wait: Wait for authentication to complete (default: True)
-        timeout: Seconds to wait for auth (default: 120)
+        user_id: Unique identifier for this user (any string you choose combine with UUID)
     """
-    # Check if already connected
-    session = session_manager.get_session_by_user(user_id)
-    if session and session.is_authenticated():
-        return f"""✅ Already connected to Google Calendar!
+    if not GOOGLE_CALENDAR_AVAILABLE:
+        return "❌ Google Calendar libraries not installed"
 
-📧 Account: {session.email}
-🔑 User ID: {user_id}
-💾 Storage: {STORAGE_MODE}
-
-You can now use calendar tools."""
-
-    # Start OAuth flow
-    result = start_oauth_flow(user_id, open_browser=not IS_CLOUD)
-
-    if not result.get("success"):
-        return f"❌ Error: {result.get('error')}"
+    result = start_oauth_flow(user_id, open_browser=True)
 
     if result.get("authenticated"):
-        return f"""✅ Connected to Google Calendar!
+        return f"""✅ Already connected as {result.get("email")}
 
-📧 Account: {result.get("email")}
-💾 Storage: {STORAGE_MODE}
+You can now use:
+• list_calendar_events(user_id="{user_id}")
+• add_calendar_event(user_id="{user_id}", ...)
+• delete_calendar_event(user_id="{user_id}", event_id="...")"""
 
-You can now use calendar tools."""
+    if result.get("success"):
+        auth_url = result.get("auth_url", "")
+        return f"""🔐 Please authenticate with Google Calendar:
 
-    # For cloud: return auth URL for user to open
-    if IS_CLOUD:
-        auth_url = result.get("auth_url")
-        return f"""🔐 Authentication required!
-
-Please open this URL in your browser to connect your Google Calendar:
-
+**Open this URL in your browser:**
 {auth_url}
 
-After signing in, return here and I'll check if you're connected.
+After completing authentication, the connection will be automatic.
 
-(Storage mode: {STORAGE_MODE} - tokens persist during server uptime)"""
+Your user_id: `{user_id}`
 
-    if not wait:
-        return """🔐 Authentication started!
+**Environment:** {"Cloud" if IS_CLOUD else "Local"}
+**Callback URL:** {CALLBACK_URL}"""
 
-Please complete sign-in in your browser.
-
-After completing authentication, call check_calendar_connection to verify."""
-
-    # Wait for callback (local only)
-    print("⏳ Waiting for authentication...")
-    auth_result = wait_for_oauth(user_id, timeout)
-
-    if auth_result.get("success") and auth_result.get("authenticated"):
-        return f"""✅ Successfully connected to Google Calendar!
-
-📧 Account: {auth_result.get("email")}
-🔑 User ID: {user_id}
-💾 Storage: {STORAGE_MODE}
-
-You can now use calendar tools like:
-• list_calendar_events
-• add_calendar_event
-• delete_calendar_event"""
-
-    error = auth_result.get("error", "Authentication failed or timed out")
-    return f"""❌ Authentication failed: {error}
-
-Please try again with connect_google_calendar."""
+    return f"❌ Error: {result.get('error', 'Unknown error')}"
 
 
 @mcp.tool()
 def check_calendar_connection(user_id: str) -> str:
-    """Check if Google Calendar is connected for a user.
+    """Check Google Calendar connection status.
 
     Args:
-        user_id: The user ID used in connect_google_calendar
+        user_id: The user ID to check
     """
     session = session_manager.get_session_by_user(user_id)
 
     if not session:
-        return f"""❌ No connection found for user: {user_id}
+        return f"""❌ No session found for user: {user_id}
 
-Use connect_google_calendar to connect."""
+Use connect_google_calendar(user_id="{user_id}") to connect."""
 
     if session.is_authenticated():
         return f"""✅ Connected to Google Calendar
 
-📧 Account: {session.email}
-🔑 User ID: {user_id}
-💾 Storage: {STORAGE_MODE}"""
+📧 Email: {session.email}
+🆔 User ID: {user_id}
+
+You can now use calendar tools with user_id="{user_id}"."""
 
     if session.pending_auth:
-        auth_url = session.pending_auth.get("flow")
-        if auth_url:
-            return f"""⏳ Authentication in progress...
+        return f"""⏳ Authentication pending...
 
-If you haven't completed sign-in yet, please open the auth URL in your browser.
-
-Started: {session.pending_auth.get("started_at", "Unknown")}"""
-        return """⏳ Authentication in progress...
-
-Please complete sign-in in your browser."""
+Please complete the OAuth flow in your browser.
+If the browser didn't open, use connect_google_calendar(user_id="{user_id}") to get a new link."""
 
     if session.auth_error:
         return f"""❌ Authentication failed: {session.auth_error}
 
-Use connect_google_calendar to try again."""
+Try again with connect_google_calendar(user_id="{user_id}")"""
 
-    return """❌ Not connected
+    return f"""❌ Not connected.
 
-Use connect_google_calendar to connect."""
+Use connect_google_calendar(user_id="{user_id}") to connect."""
 
 
 @mcp.tool()
@@ -1062,16 +1077,16 @@ Use connect_google_calendar(user_id="{user_id}") first."""
         return f"❌ Error: {e}"
 
 
-# =============================================================================
+# ---------
 # MCP RESOURCES
-# =============================================================================
+# ---------
 
 
 @mcp.resource("config://settings")
 def get_config() -> str:
     return json.dumps(
         {
-            "version": "8.0.0",
+            "version": VERSION,
             "multi_user": True,
             "auto_callback": True,
             "callback_url": CALLBACK_URL,
@@ -1101,15 +1116,16 @@ def get_connected_users() -> str:
     return json.dumps({"users": users, "storage_mode": STORAGE_MODE}, indent=2)
 
 
-# =============================================================================
+# ---------
 # MAIN
-# =============================================================================
+# ---------
 
 
 def main():
     logger.info("=" * 60)
     logger.info("MCP Multi-User Calendar Server (Cloud-Ready)")
     logger.info("=" * 60)
+    logger.info(f"Version: {VERSION}")
     logger.info(f"Host: {HOST}:{PORT}")
     logger.info(f"Callback: {CALLBACK_URL}")
     logger.info(f"Mode: {'Cloud' if IS_CLOUD else 'Local'}")
@@ -1117,10 +1133,13 @@ def main():
     logger.info(f"Google: {'✓' if GOOGLE_CALENDAR_AVAILABLE else '✗'}")
     logger.info("=" * 60)
 
-    # Start callback server (local only)
-    start_callback_server()
+    if IS_CLOUD:
+        logger.info("Cloud mode")
+    else:
+        logger.info("Local mode")
 
     logger.info(f"MCP endpoint: http://{HOST}:{PORT}/mcp")
+    logger.info("Custom routes: /, /callback, /health, /auth/check")
     logger.info("Ready!")
 
     mcp.run(transport="streamable-http")
