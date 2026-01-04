@@ -7,3 +7,12 @@ services:
     envVars:
       - key: GOOGLE_CREDENTIALS_JSON
         sync: false
+      - key: OAUTH_CALLBACK_URL
+        sync: false
+      - key: DATA_STORAGE_PATH
+        value: /tmp/data
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 8000
+    healthCheckPath: /health
