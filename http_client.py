@@ -9,7 +9,7 @@ AUTOMATIC AUTHENTICATION:
 WORKFLOW:
 1. User asks to see calendar
 2. AI calls connect_google_calendar(user_id="...")
-3. Browser opens automatically
+3. Browser opens automatically (local) or shows auth URL (cloud)
 4. User signs in with Google
 5. Callback completes - user is connected
 6. Calendar tools work automatically
@@ -50,7 +50,7 @@ def get_server_url() -> str:
 
 
 SERVER_URL = get_server_url()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 def mcp_tool_to_genai_declaration(tool: mcp_types.Tool) -> types.FunctionDeclaration:
@@ -117,7 +117,8 @@ IMPORTANT - AUTOMATIC AUTHENTICATION:
 
 CALENDAR WORKFLOW:
 1. First calendar request: Call connect_google_calendar(user_id="{self.user_id}")
-   - Browser opens automatically for user to sign in
+   - For local: Browser opens automatically for user to sign in
+   - For cloud: Shows auth URL that user must open
    - Wait for auth to complete (the tool handles this)
    
 2. Subsequent requests: Use the same user_id="{self.user_id}" for all calendar tools:
@@ -130,7 +131,12 @@ CALENDAR WORKFLOW:
 4. To disconnect: disconnect_google_calendar(user_id="{self.user_id}")
 
 NEVER ask the user for their user_id - always use "{self.user_id}".
-The OAuth callback handles everything automatically."""
+The OAuth callback handles everything automatically.
+
+For cloud deployments:
+- If connect_google_calendar returns an auth URL, show it to the user
+- Ask user to open the URL, sign in, then come back
+- After they say they've signed in, call check_calendar_connection to verify"""
 
         # Initialize chat with system prompt
         self.chat_history.append(
@@ -247,7 +253,7 @@ The OAuth callback handles everything automatically."""
 
         config = types.GenerateContentConfig(
             tools=tools,  # type: ignore
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(  # type: ignore
                 disable=True
             ),
             temperature=0.7,
@@ -369,6 +375,7 @@ The OAuth callback handles everything automatically."""
         print("  'resources' - List resources")
         print("  'status'    - Check calendar connection")
         print("  'connect'   - Connect to Google Calendar")
+        print("  'config'    - Show server config")
         print("  'clear'     - Clear chat")
         print("  'quit'      - Exit")
         print("=" * 60)
@@ -413,6 +420,11 @@ The OAuth callback handles everything automatically."""
                         {"user_id": self.user_id, "wait": True},
                     )
                     print(f"\n{result}")
+                    continue
+
+                if user_input.lower() == "config":
+                    config = await self.read_resource("config://settings")
+                    print(f"\n⚙️ Server Config:\n{config}")
                     continue
 
                 if user_input.lower() == "clear":

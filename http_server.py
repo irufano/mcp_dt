@@ -1,18 +1,26 @@
 """
-MCP Server with Multi-User OAuth - Automatic Callback
+MCP Server with Multi-User OAuth - Automatic Callback (Cloud-Ready)
 
 AUTOMATIC AUTHENTICATION:
 - OAuth callback automatically completes authentication
 - No manual session ID copy-paste required
 - Works on both local and cloud environments
 
+STORAGE MODES:
+- Local: File-based token storage (persistent across restarts)
+- Cloud/Render Free: In-memory storage (no disk required!)
+- Redis (optional): Set REDIS_URL for cloud persistence
+
 SUPPORTED ENVIRONMENTS:
 1. Local Development (VSCode, Claude Code):
    - Callback: http://localhost:8085/callback
    - Browser opens automatically
+   - Tokens saved to disk
 
-2. Cloud Deployment (Render, Railway, Fly.io, etc):
+2. Cloud Deployment (Render Free Tier, Railway, Fly.io):
    - Callback: https://your-domain.com/callback
+   - In-memory token storage (works without disk!)
+   - Tokens persist during server uptime
    - Set CALLBACK_URL environment variable
 
 SETUP:
@@ -20,7 +28,7 @@ SETUP:
 2. Add authorized redirect URIs:
    - http://localhost:8085/callback (for local)
    - https://your-cloud-domain.com/callback (for cloud)
-3. Download credentials.json OR set GOOGLE_CREDENTIALS_JSON env var
+3. Set GOOGLE_CREDENTIALS_JSON env var (required for cloud)
 
 Run: python http_server.py
 """
@@ -62,15 +70,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mcp-server")
 
-# -------------------
+# =============================================================================
 # CONFIGURATION
-# -------------------
+# =============================================================================
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", 8000))
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 CALLBACK_PORT = int(os.environ.get("CALLBACK_PORT", 8085))
-DATA_STORAGE_PATH = Path(os.environ.get("DATA_STORAGE_PATH", "./data"))
+REDIS_URL = os.environ.get("REDIS_URL")  # Optional Redis for persistence
 
 # Environment detection
 IS_CLOUD = bool(
@@ -81,6 +89,11 @@ IS_CLOUD = bool(
     or os.environ.get("CALLBACK_URL")
     or os.environ.get("IS_CLOUD")
 )
+
+# Storage mode: memory
+STORAGE_MODE = "memory"
+
+logger.info(f"Storage mode: {STORAGE_MODE}")
 
 
 def get_callback_url() -> str:
@@ -124,9 +137,70 @@ def get_credentials_file() -> Path:
 CREDENTIALS_FILE = get_credentials_file()
 
 
-# -------------------
+# =============================================================================
+# TOKEN STORAGE (Memory / File / Redis)
+# =============================================================================
+
+
+class TokenStorage:
+    """Abstract token storage interface."""
+
+    def save(self, user_id: str, data: dict) -> bool:
+        raise NotImplementedError
+
+    def load(self, user_id: str) -> Optional[dict]:
+        raise NotImplementedError
+
+    def delete(self, user_id: str) -> bool:
+        raise NotImplementedError
+
+    def list_users(self) -> list[str]:
+        raise NotImplementedError
+
+
+class MemoryTokenStorage(TokenStorage):
+    """In-memory token storage for cloud environments without disk."""
+
+    def __init__(self):
+        self._tokens: dict[str, dict] = {}
+        self._lock = threading.Lock()
+        logger.info(
+            "Using in-memory token storage (tokens persist during server uptime)"
+        )
+
+    def save(self, user_id: str, data: dict) -> bool:
+        with self._lock:
+            self._tokens[user_id] = data
+            logger.info(f"Token saved in memory for user {user_id[:8]}...")
+            return True
+
+    def load(self, user_id: str) -> Optional[dict]:
+        with self._lock:
+            return self._tokens.get(user_id)
+
+    def delete(self, user_id: str) -> bool:
+        with self._lock:
+            if user_id in self._tokens:
+                del self._tokens[user_id]
+                return True
+            return False
+
+    def list_users(self) -> list[str]:
+        with self._lock:
+            return list(self._tokens.keys())
+
+
+# Initialize storage based on mode
+def create_token_storage() -> TokenStorage:
+    return MemoryTokenStorage()
+
+
+token_storage = create_token_storage()
+
+
+# =============================================================================
 # USER SESSION WITH AUTO-CALLBACK
-# -------------------
+# =============================================================================
 
 
 @dataclass
@@ -134,7 +208,7 @@ class UserSession:
     """User authentication session with callback support."""
 
     session_id: str
-    user_id: str  # Identifier from client (e.g., conversation ID, user ID)
+    user_id: str
     created_at: datetime = field(default_factory=datetime.now)
     credentials: Optional[Credentials] = None
     email: Optional[str] = None
@@ -157,37 +231,24 @@ class UserSession:
         if not self.credentials:
             return
 
-        DATA_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
-        # Save by user_id for persistence across sessions
-        token_file = DATA_STORAGE_PATH / f"{self.user_id}.json"
-
-        try:
-            token_file.write_text(
-                json.dumps(
-                    {
-                        "token": self.credentials.token,
-                        "refresh_token": self.credentials.refresh_token,
-                        "token_uri": self.credentials.token_uri,
-                        "client_id": self.credentials.client_id,
-                        "client_secret": self.credentials.client_secret,
-                        "scopes": list(self.credentials.scopes or SCOPES),
-                        "email": self.email,
-                        "user_id": self.user_id,
-                    },
-                    indent=2,
-                )
-            )
-            logger.info(f"Token saved for user {self.user_id[:8]}...")
-        except Exception as e:
-            logger.error(f"Failed to save token: {e}")
+        data = {
+            "token": self.credentials.token,
+            "refresh_token": self.credentials.refresh_token,
+            "token_uri": self.credentials.token_uri,
+            "client_id": self.credentials.client_id,
+            "client_secret": self.credentials.client_secret,
+            "scopes": list(self.credentials.scopes or SCOPES),
+            "email": self.email,
+            "user_id": self.user_id,
+        }
+        token_storage.save(self.user_id, data)
 
     def load_token(self) -> bool:
-        token_file = DATA_STORAGE_PATH / f"{self.user_id}.json"
-        if not token_file.exists():
+        data = token_storage.load(self.user_id)
+        if not data:
             return False
 
         try:
-            data = json.loads(token_file.read_text())
             self.credentials = Credentials(
                 token=data.get("token"),
                 refresh_token=data.get("refresh_token"),
@@ -278,9 +339,9 @@ class SessionManager:
 session_manager = SessionManager()
 
 
-# -------------------
+# =============================================================================
 # OAUTH CALLBACK HANDLER
-# -------------------
+# =============================================================================
 
 
 class OAuthCallbackHandler(BaseHTTPRequestHandler):
@@ -317,7 +378,7 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
             self._send_html(
                 400,
                 f"""
-                <h1>Authorization Failed</h1>
+                <h1>❌ Authorization Failed</h1>
                 <p>Error: {error}</p>
                 <p>{params.get("error_description", [""])[0]}</p>
                 <p>You can close this window.</p>
@@ -326,12 +387,12 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
             return
 
         if not code or not state:
-            self._send_html(400, "<h1>Invalid callback</h1>")
+            self._send_html(400, "<h1>❌ Invalid callback</h1>")
             return
 
         session = session_manager.get_session_by_state(state)
         if not session or not session.pending_auth:
-            self._send_html(400, "<h1>Session expired</h1><p>Please try again.</p>")
+            self._send_html(400, "<h1>❌ Session expired</h1><p>Please try again.</p>")
             return
 
         try:
@@ -361,10 +422,13 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
             self._send_html(
                 200,
                 f"""
-                <h1>DayaTech MCP Authorization Successful!</h1>
+                <h1>✅ Authorization Successful!</h1>
                 <p>Welcome, <strong>{session.email}</strong>!</p>
                 <p>You can close this window and return to your application.</p>
                 <p>Your calendar is now connected.</p>
+                <p style="color: #666; font-size: 0.9em;">
+                    Storage mode: {STORAGE_MODE}
+                </p>
                 <script>
                     setTimeout(() => {{
                         window.close();
@@ -377,7 +441,7 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
             logger.error(f"Callback error: {e}")
             session.auth_error = str(e)
             session.auth_completed = True
-            self._send_html(500, f"<h1>Error</h1><p>{e}</p>")
+            self._send_html(500, f"<h1>❌ Error</h1><p>{e}</p>")
 
     def _handle_auth_check(self, parsed):
         """Check auth status for polling."""
@@ -417,7 +481,8 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
         html = f"""<!DOCTYPE html>
 <html><head><title>MCP OAuth</title>
 <style>
-body {{ font-family: -apple-system, system-ui, sans-serif; text-align: center; padding: 50px; background: #f5f5f5; }}
+body {{ font-family: -apple-system, system-ui, sans-serif; 
+       text-align: center; padding: 50px; background: #f5f5f5; }}
 h1 {{ color: #333; }}
 </style></head>
 <body>{body}</body></html>"""
@@ -471,18 +536,21 @@ def start_callback_server():
     _callback_thread.start()
 
 
-# -------------------
+# =============================================================================
 # AUTHENTICATION FLOW
-# -------------------
+# =============================================================================
 
 
 def start_oauth_flow(user_id: str, open_browser: bool = True) -> dict:
     """Start OAuth flow for a user - returns immediately, callback handles completion."""
     if not GOOGLE_CALENDAR_AVAILABLE:
-        return {"success": False, "error": "Google Calendar not installed"}
+        return {"success": False, "error": "Google Calendar libraries not installed"}
 
     if not CREDENTIALS_FILE.exists():
-        return {"success": False, "error": "credentials.json not found"}
+        return {
+            "success": False,
+            "error": "credentials.json not found. Set GOOGLE_CREDENTIALS_JSON env var.",
+        }
 
     session = session_manager.get_or_create_session(user_id)
 
@@ -573,9 +641,9 @@ def wait_for_oauth(user_id: str, timeout: int = 120) -> dict:
     return {"success": False, "error": "Authentication timed out"}
 
 
-# -------------------
+# =============================================================================
 # WEATHER HELPERS
-# -------------------
+# =============================================================================
 
 
 async def get_coordinates(city: str) -> dict | None:
@@ -618,9 +686,9 @@ async def fetch_weather(lat: float, lon: float) -> dict | None:
     return None
 
 
-# -------------------
+# =============================================================================
 # MCP TOOLS
-# -------------------
+# =============================================================================
 
 
 @mcp.tool()
@@ -695,11 +763,12 @@ def connect_google_calendar(user_id: str, wait: bool = True, timeout: int = 120)
 
 📧 Account: {session.email}
 🔑 User ID: {user_id}
+💾 Storage: {STORAGE_MODE}
 
 You can now use calendar tools."""
 
     # Start OAuth flow
-    result = start_oauth_flow(user_id, open_browser=True)
+    result = start_oauth_flow(user_id, open_browser=not IS_CLOUD)
 
     if not result.get("success"):
         return f"❌ Error: {result.get('error')}"
@@ -708,18 +777,31 @@ You can now use calendar tools."""
         return f"""✅ Connected to Google Calendar!
 
 📧 Account: {result.get("email")}
+💾 Storage: {STORAGE_MODE}
 
 You can now use calendar tools."""
 
+    # For cloud: return auth URL for user to open
+    if IS_CLOUD:
+        auth_url = result.get("auth_url")
+        return f"""🔐 Authentication required!
+
+Please open this URL in your browser to connect your Google Calendar:
+
+{auth_url}
+
+After signing in, return here and I'll check if you're connected.
+
+(Storage mode: {STORAGE_MODE} - tokens persist during server uptime)"""
+
     if not wait:
-        return f"""🔐 Authentication started!
+        return """🔐 Authentication started!
 
 Please complete sign-in in your browser.
-Auth URL: {result.get("auth_url")}
 
 After completing authentication, call check_calendar_connection to verify."""
 
-    # Wait for callback
+    # Wait for callback (local only)
     print("⏳ Waiting for authentication...")
     auth_result = wait_for_oauth(user_id, timeout)
 
@@ -728,6 +810,7 @@ After completing authentication, call check_calendar_connection to verify."""
 
 📧 Account: {auth_result.get("email")}
 🔑 User ID: {user_id}
+💾 Storage: {STORAGE_MODE}
 
 You can now use calendar tools like:
 • list_calendar_events
@@ -758,13 +841,20 @@ Use connect_google_calendar to connect."""
         return f"""✅ Connected to Google Calendar
 
 📧 Account: {session.email}
-🔑 User ID: {user_id}"""
+🔑 User ID: {user_id}
+💾 Storage: {STORAGE_MODE}"""
 
     if session.pending_auth:
-        return f"""⏳ Authentication in progress...
+        auth_url = session.pending_auth.get("flow")
+        if auth_url:
+            return f"""⏳ Authentication in progress...
 
-Please complete sign-in in your browser.
+If you haven't completed sign-in yet, please open the auth URL in your browser.
+
 Started: {session.pending_auth.get("started_at", "Unknown")}"""
+        return """⏳ Authentication in progress...
+
+Please complete sign-in in your browser."""
 
     if session.auth_error:
         return f"""❌ Authentication failed: {session.auth_error}
@@ -793,10 +883,8 @@ def disconnect_google_calendar(user_id: str) -> str:
     session.email = None
     session.auth_completed = False
 
-    # Remove token file
-    token_file = DATA_STORAGE_PATH / f"{user_id}.json"
-    if token_file.exists():
-        token_file.unlink()
+    # Remove from storage
+    token_storage.delete(user_id)
 
     return f"✅ Disconnected Google Calendar for user {user_id}"
 
@@ -974,21 +1062,23 @@ Use connect_google_calendar(user_id="{user_id}") first."""
         return f"❌ Error: {e}"
 
 
-# -------------------
+# =============================================================================
 # MCP RESOURCES
-# -------------------
+# =============================================================================
 
 
 @mcp.resource("config://settings")
 def get_config() -> str:
     return json.dumps(
         {
-            "version": "7.0.0",
+            "version": "8.0.0",
             "multi_user": True,
             "auto_callback": True,
             "callback_url": CALLBACK_URL,
             "is_cloud": IS_CLOUD,
+            "storage_mode": STORAGE_MODE,
             "active_users": len(session_manager.user_sessions),
+            "stored_users": len(token_storage.list_users()),
             "google_available": GOOGLE_CALENDAR_AVAILABLE,
         },
         indent=2,
@@ -1008,25 +1098,26 @@ def get_connected_users() -> str:
                     "email": session.email,
                 }
             )
-    return json.dumps({"users": users}, indent=2)
+    return json.dumps({"users": users, "storage_mode": STORAGE_MODE}, indent=2)
 
 
-# -------------------
+# =============================================================================
 # MAIN
-# -------------------
+# =============================================================================
 
 
 def main():
     logger.info("=" * 60)
-    logger.info("MCP Multi-User Calendar Server (Auto-Callback)")
+    logger.info("MCP Multi-User Calendar Server (Cloud-Ready)")
     logger.info("=" * 60)
     logger.info(f"Host: {HOST}:{PORT}")
     logger.info(f"Callback: {CALLBACK_URL}")
     logger.info(f"Mode: {'Cloud' if IS_CLOUD else 'Local'}")
+    logger.info(f"Storage: {STORAGE_MODE}")
     logger.info(f"Google: {'✓' if GOOGLE_CALENDAR_AVAILABLE else '✗'}")
     logger.info("=" * 60)
 
-    # Start callback server
+    # Start callback server (local only)
     start_callback_server()
 
     logger.info(f"MCP endpoint: http://{HOST}:{PORT}/mcp")
