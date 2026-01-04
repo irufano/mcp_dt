@@ -69,3 +69,8 @@ The server will start at `http://localhost:8000/mcp`
 cd mcp_samples
 python clients/http_client.py
 ```
+
+
+Terima kasih kepada teman-teman yang telah mengikuti AI Class hingga tahap ini. Mohon kesediaannya untuk mengisi feedback melalui link dibawah ini.  Masukan Anda sangat berarti dalam mendukung pengembangan AI Class selanjutnya.
+
+https://docs.google.com/forms/d/e/1FAIpQLSf44GYat6qAVX9hYjFLyD8HnrmvOqpR4JyGjwUikE6F_baIcA/viewform?usp=dialog

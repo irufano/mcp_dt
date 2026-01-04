@@ -1,23 +1,20 @@
 """
-MCP Client with Automatic OAuth Callback
+MCP Client with Stdio Transport
 
-AUTOMATIC AUTHENTICATION:
-- No manual session ID copy-paste required
-- OAuth callback automatically completes authentication
-- Client tracks user_id for seamless calendar access
+This client connects to the MCP server via stdio (subprocess).
+The server runs as a child process, communicating via stdin/stdout.
 
 WORKFLOW:
-1. User asks to see calendar
-2. AI calls connect_google_calendar(user_id="...")
-3. Browser opens automatically (local) or shows auth URL (cloud)
-4. User signs in with Google
-5. Callback completes - user is connected
-6. Calendar tools work automatically
+1. Client spawns server as subprocess
+2. Communication happens via stdin/stdout (JSON-RPC)
+3. OAuth callback handled by local callback server in the server process
 
 Run:
-    python http_client.py
-    python http_client.py http://localhost:8000/mcp
-    python http_client.py https://your-server.com/mcp
+    python stdio_client.py
+
+Environment Variables:
+    GEMINI_API_KEY or GOOGLE_API_KEY - Required for AI
+    USER_ID - Optional custom user ID
 """
 
 import asyncio
@@ -32,7 +29,7 @@ from google import genai
 from google.genai import types
 from mcp import ClientSession
 from mcp import types as mcp_types
-from mcp.client.streamable_http import streamable_http_client
+from mcp.client.stdio import StdioServerParameters, stdio_client
 
 load_dotenv()
 
@@ -40,16 +37,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger("mcp-client")
+logger = logging.getLogger("mcp-stdio-client")
 
-
-def get_server_url() -> str:
-    if len(sys.argv) > 1:
-        return sys.argv[1]
-    return os.environ.get("MCP_SERVER_URL", "http://localhost:8000/mcp")
-
-
-SERVER_URL = get_server_url()
+# Server script path - can be overridden via env var
+SERVER_SCRIPT = os.environ.get("MCP_SERVER_SCRIPT", "stdio_server.py")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 
@@ -90,11 +81,11 @@ def mcp_tool_to_genai_declaration(tool: mcp_types.Tool) -> types.FunctionDeclara
     )
 
 
-class MCPAutoCallbackClient:
-    """MCP Client with automatic OAuth callback handling."""
+class MCPStdioClient:
+    """MCP Client using stdio transport (subprocess)."""
 
-    def __init__(self, server_url: str = SERVER_URL):
-        self.server_url = server_url
+    def __init__(self, server_script: str = SERVER_SCRIPT):
+        self.server_script = server_script
         self.session: Optional[ClientSession] = None
         self.genai_client: Optional[genai.Client] = None
         self.tools: list[mcp_types.Tool] = []
@@ -103,7 +94,7 @@ class MCPAutoCallbackClient:
         self.function_declarations: list[types.FunctionDeclaration] = []
         self.chat_history: list[types.Content] = []
 
-        # User ID for this client session - used for calendar auth
+        # User ID for this client session
         self.user_id: str = os.environ.get("USER_ID") or str(uuid.uuid4())[:16]
 
         # System prompt with automatic user_id injection
@@ -117,8 +108,7 @@ IMPORTANT - AUTOMATIC AUTHENTICATION:
 
 CALENDAR WORKFLOW:
 1. First calendar request: Call connect_google_calendar(user_id="{self.user_id}")
-   - For local: Browser opens automatically for user to sign in
-   - For cloud: Shows auth URL that user must open
+   - Browser opens automatically for user to sign in
    - Wait for auth to complete (the tool handles this)
    
 2. Subsequent requests: Use the same user_id="{self.user_id}" for all calendar tools:
@@ -131,12 +121,7 @@ CALENDAR WORKFLOW:
 4. To disconnect: disconnect_google_calendar(user_id="{self.user_id}")
 
 NEVER ask the user for their user_id - always use "{self.user_id}".
-The OAuth callback handles everything automatically.
-
-For cloud deployments:
-- If connect_google_calendar returns an auth URL, show it to the user
-- Ask user to open the URL, sign in, then come back
-- After they say they've signed in, call check_calendar_connection to verify"""
+The OAuth callback handles everything automatically."""
 
         # Initialize chat with system prompt
         self.chat_history.append(
@@ -168,22 +153,38 @@ For cloud deployments:
         logger.info("GenAI client initialized")
 
     async def connect_to_server(self):
-        """Connect to MCP server."""
-        logger.info(f"Connecting to: {self.server_url}")
+        """Connect to MCP server via stdio (subprocess)."""
+        logger.info(f"Starting server: {self.server_script}")
+
+        # Determine python command
+        python_cmd = sys.executable
+
+        # Server parameters for stdio transport
+        server_params = StdioServerParameters(
+            command=python_cmd,
+            args=[self.server_script],
+            env={
+                **os.environ,
+                "PYTHONUNBUFFERED": "1",
+            },
+        )
 
         try:
-            self._http_cm = streamable_http_client(self.server_url)
-            read_stream, write_stream, _ = await self._http_cm.__aenter__()
+            self._stdio_cm = stdio_client(server_params)
+            read_stream, write_stream = await self._stdio_cm.__aenter__()
 
             self._session_cm = ClientSession(read_stream, write_stream)
             self.session = await self._session_cm.__aenter__()
 
             await self.session.initialize()
-            logger.info("MCP session initialized")
+            logger.info("MCP session initialized via stdio")
 
             # Get tools
             tools_response = await self.session.list_tools()
             self.tools = tools_response.tools
+
+            prompts_response = await self.session.list_prompts()
+            self.prompts = prompts_response.prompts
 
             # Get resources
             try:
@@ -191,6 +192,7 @@ For cloud deployments:
                 self.resources = resources_response.resources
             except Exception:
                 self.resources = []
+                
 
             # Convert to GenAI format
             self.function_declarations = [
@@ -199,18 +201,20 @@ For cloud deployments:
 
             logger.info(f"Loaded {len(self.tools)} tools")
 
-        except ConnectionRefusedError:
-            raise ConnectionRefusedError(
-                f"Cannot connect to: {self.server_url}\n"
-                "Start the server: python http_server.py"
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"Server script not found: {self.server_script}\n"
+                "Make sure stdio_server.py is in the current directory."
             )
+        except Exception as e:
+            raise RuntimeError(f"Failed to start server: {e}")
 
     async def cleanup(self):
         """Clean up connections."""
         if hasattr(self, "_session_cm"):
             await self._session_cm.__aexit__(None, None, None)
-        if hasattr(self, "_http_cm"):
-            await self._http_cm.__aexit__(None, None, None)
+        if hasattr(self, "_stdio_cm"):
+            await self._stdio_cm.__aexit__(None, None, None)
 
     async def call_mcp_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """Call an MCP tool."""
@@ -233,33 +237,29 @@ For cloud deployments:
             return "\n".join(text_parts)
 
         except Exception as e:
-            logger.error(f"Tool error {tool_name}: {e}")
-            return f"Error: {str(e)}"
+            logger.error(f"Tool call error: {e}")
+            return f"Error calling {tool_name}: {str(e)}"
 
     async def process_message(self, user_message: str) -> str:
-        """Process user message."""
+        """Process user message with GenAI and MCP tools."""
         if not self.genai_client:
             return "Error: GenAI not initialized"
 
-        # Add user message
         self.chat_history.append(
-            types.Content(role="user", parts=[types.Part.from_text(text=user_message)])
-        )
-
-        # Configure tools
-        tools = None
-        if self.function_declarations:
-            tools = [types.Tool(function_declarations=self.function_declarations)]
-
-        config = types.GenerateContentConfig(
-            tools=tools,  # type: ignore
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(  # type: ignore
-                disable=True
-            ),
-            temperature=0.7,
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=user_message)],
+            )
         )
 
         try:
+            config = types.GenerateContentConfig(
+                tools=[types.Tool(function_declarations=self.function_declarations)],
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
+                ),
+            )
+
             response = self.genai_client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=self.chat_history,
@@ -364,9 +364,9 @@ For cloud deployments:
     async def chat_loop(self):
         """Interactive chat loop."""
         print("\n" + "=" * 60)
-        print("MCP CLIENT WITH AUTO-CALLBACK OAUTH")
+        print("MCP STDIO CLIENT")
         print("=" * 60)
-        print(f"Server: {self.server_url}")
+        print(f"Server: {self.server_script}")
         print(f"Model: {GEMINI_MODEL}")
         print(f"User ID: {self.user_id}")
         print("=" * 60)
@@ -381,6 +381,9 @@ For cloud deployments:
         print("=" * 60)
         print("\nTry: 'show my calendar' or 'add meeting tomorrow at 2pm'")
         print("=" * 60 + "\n")
+
+        if self.session is None:
+            raise ValueError("Initialize first")
 
         while True:
             try:
@@ -397,7 +400,8 @@ For cloud deployments:
                 if user_input.lower() == "tools":
                     print("\n📦 Tools:")
                     for tool in self.tools:
-                        print(f"   • {tool.name}: {tool.description[:60]}...")  # type: ignore
+                        desc = tool.description or ""
+                        print(f"   • {tool.name}: {desc[:60]}...")
                     continue
 
                 if user_input.lower() == "resources":
@@ -417,7 +421,7 @@ For cloud deployments:
                     print("\n🔐 Starting Google Calendar connection...")
                     result = await self.call_mcp_tool(
                         "connect_google_calendar",
-                        {"user_id": self.user_id, "wait": True},
+                        {"user_id": self.user_id},
                     )
                     print(f"\n{result}")
                     continue
@@ -427,9 +431,57 @@ For cloud deployments:
                     print(f"\n⚙️ Server Config:\n{config}")
                     continue
 
-                if user_input.lower() == "user-connected":
-                    config = await self.read_resource("users://connected")
-                    print(f"\n⚙️ Server Config:\n{config}")
+                if user_input.lower().startswith("read "):
+                    uri = user_input[5:].strip()
+                    try:
+                        from pydantic import AnyUrl
+
+                        result = await self.session.read_resource(AnyUrl(uri))
+                        print(f"\n📖 Resource content ({uri}):")
+                        for content in result.contents:
+                            if hasattr(content, "text"):
+                                print(content.text)  # type: ignore
+                            else:
+                                print(str(content))
+                    except Exception as e:
+                        print(f"\n❌ Error reading resource: {e}")
+                    continue
+
+                if user_input.lower().startswith("use "):
+                    prompt_name = user_input[4:].strip()
+                    # Find the prompt
+                    prompt_info = next(
+                        (p for p in self.prompts if p.name == prompt_name), None
+                    )
+                    if not prompt_info:
+                        print(f"\n❌ Prompt '{prompt_name}' not found")
+                        continue
+
+                    # Collect arguments if needed
+                    args = {}
+                    if prompt_info.arguments:
+                        print(f"\nEnter arguments for '{prompt_name}':")
+                        for arg in prompt_info.arguments:
+                            required = "(required)" if arg.required else "(optional)"
+                            value = input(f"   {arg.name} {required}: ").strip()
+                            if value:
+                                args[arg.name] = value
+
+                    try:
+                        result = await self.session.get_prompt(
+                            prompt_name, arguments=args
+                        )
+                        # Use the prompt content as the user message
+                        prompt_text = ""
+                        for msg in result.messages:
+                            if hasattr(msg.content, "text"):
+                                prompt_text += msg.content.text + "\n"  # type: ignore
+
+                        print(f"\n📝 Using prompt '{prompt_name}'...")
+                        response = await self.process_message(prompt_text)
+                        print(f"\n🤖 Gemini: {response}")
+                    except Exception as e:
+                        print(f"\n❌ Error using prompt: {e}")
                     continue
 
                 if user_input.lower() == "clear":
@@ -451,16 +503,16 @@ For cloud deployments:
 
 async def run_client():
     """Run the client."""
-    client = MCPAutoCallbackClient(server_url=SERVER_URL)
+    client = MCPStdioClient(server_script=SERVER_SCRIPT)
 
     try:
         await client.initialize_genai()
         await client.connect_to_server()
 
         print("\n" + "=" * 60)
-        print("CONNECTED TO MCP SERVER")
+        print("CONNECTED TO MCP SERVER (STDIO)")
         print("=" * 60)
-        print(f"URL: {SERVER_URL}")
+        print(f"Server: {SERVER_SCRIPT}")
         print(f"User ID: {client.user_id}")
 
         print(f"\n📦 Tools ({len(client.tools)}):")
@@ -482,17 +534,17 @@ async def run_client():
 
 def main():
     print("\n" + "=" * 60)
-    print("MCP AUTO-CALLBACK CLIENT")
+    print("MCP STDIO CLIENT")
     print("=" * 60)
     print(f"Model: {GEMINI_MODEL}")
-    print(f"Server: {SERVER_URL}")
-    print("\n⚠️ Start the server first: python http_server.py\n")
+    print(f"Server: {SERVER_SCRIPT}")
+    print()
 
     try:
         asyncio.run(run_client())
     except KeyboardInterrupt:
         print("\n\nStopped")
-    except ConnectionRefusedError as e:
+    except FileNotFoundError as e:
         print(f"\n❌ {e}")
     except Exception as e:
         logger.error(f"Error: {e}")
