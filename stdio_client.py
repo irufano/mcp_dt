@@ -1,20 +1,8 @@
 """
 MCP Client with Stdio Transport
 
-This client connects to the MCP server via stdio (subprocess).
-The server runs as a child process, communicating via stdin/stdout.
-
-WORKFLOW:
-1. Client spawns server as subprocess
-2. Communication happens via stdin/stdout (JSON-RPC)
-3. OAuth callback handled by local callback server in the server process
-
 Run:
     python stdio_client.py
-
-Environment Variables:
-    GEMINI_API_KEY or GOOGLE_API_KEY - Required for AI
-    USER_ID - Optional custom user ID
 """
 
 import asyncio

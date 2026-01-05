@@ -1,13 +1,6 @@
 """
 MCP Server with Multi-User OAuth - Automatic Callback (Cloud-Ready)
 
-Added /callback route using FastMCP's @custom_route decorator
-This ensures the callback works in cloud deployment (Render, Railway, etc.)
-
-API:
-https://open-meteo.com/
-
-
 AUTOMATIC AUTHENTICATION:
 - OAuth callback automatically completes authentication
 - No manual session ID copy-paste required
@@ -18,11 +11,11 @@ STORAGE MODES:
 
 SUPPORTED ENVIRONMENTS:
 1. Local Development (VSCode, Claude Code):
-   - Callback: http://localhost:8085/callback (separate server)
+   - Callback: http://localhost:8000/callback
    - Browser opens automatically
    - In-memory token storage (works without disk!)
 
-2. Cloud Deployment (Render Free Tier, Railway, Fly.io):
+2. Cloud Deployment (Render Free Tier):
    - Callback: https://your-domain.com/callback (same server via custom_route)
    - In-memory token storage (works without disk!)
    - Tokens persist during server uptime
@@ -35,7 +28,8 @@ SETUP:
    - https://your-cloud-domain.com/callback (for cloud)
 3. Set GOOGLE_CREDENTIALS_JSON env var (required for cloud)
 
-Run: python http_server.py
+Run:
+    python http_server.py
 """
 
 import json
@@ -1100,6 +1094,11 @@ def get_config() -> str:
     )
 
 
+# ---------
+# MCP PROMPTS
+# ---------
+
+
 @mcp.resource("users://connected")
 def get_connected_users() -> str:
     users = []
@@ -1114,6 +1113,45 @@ def get_connected_users() -> str:
                 }
             )
     return json.dumps({"users": users, "storage_mode": STORAGE_MODE}, indent=2)
+
+
+@mcp.prompt()
+def travel_advisory(cities: str) -> str:
+    """Generate a travel weather advisory prompt for multiple cities.
+
+    Args:
+        cities: Comma-separated list of cities (e.g., "London, Paris, Tokyo")
+
+    Use this prompt to compare weather across multiple destinations.
+    """
+    logger.info(f"Generating travel advisory prompt for: {cities}")
+
+    city_list = [c.strip() for c in cities.split(",")]
+
+    return f"""Please provide a travel weather advisory comparing these destinations: {", ".join(city_list)}
+
+For each city, use the get_weather tool to fetch current conditions.
+
+Then provide:
+
+1. **Weather Comparison Table**
+   - Compare temperatures, conditions, and humidity across all cities
+
+2. **Packing Recommendations**
+   - What to pack that works for all destinations
+   - Destination-specific items needed
+
+3. **Best Time to Visit**
+   - Rank the cities by current weather pleasantness
+   - Note any weather concerns for each location
+
+4. **Travel Tips**
+   - Weather-related travel advice for each destination
+   - Any alerts or warnings to be aware of
+
+Cities to analyze: {", ".join(city_list)}
+
+Please fetch weather for each city and then compile your advisory."""
 
 
 # ---------

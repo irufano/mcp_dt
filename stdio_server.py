@@ -4,22 +4,8 @@ MCP Server with Stdio Transport - Multi-User OAuth Support
 This is the stdio transport version of the HTTP MCP server.
 Communication happens via stdin/stdout instead of HTTP.
 
-API:
-https://open-meteo.com/
-
-AUTHENTICATION NOTES (STDIO MODE):
-- OAuth flow requires manual URL handling (no browser auto-open in all cases)
-- Token storage still works in memory
-- Callback handling is different - uses local callback server
-
-STORAGE MODES:
-- In-memory storage (no disk required!)
-
 Run:
     python stdio_server.py
-
-Or via MCP client:
-    python stdio_client.py
 """
 
 import json
@@ -970,9 +956,6 @@ def get_config() -> str:
         indent=2,
     )
 
-# ---------
-# MCP PROMPTS
-# ---------
 
 @mcp.resource("users://connected")
 def get_connected_users() -> str:
@@ -988,6 +971,11 @@ def get_connected_users() -> str:
                 }
             )
     return json.dumps({"users": users}, indent=2)
+
+
+# ---------
+# MCP PROMPTS
+# ---------
 
 
 @mcp.prompt()

@@ -1,19 +1,6 @@
 """
 MCP Client with Automatic OAuth Callback
 
-AUTOMATIC AUTHENTICATION:
-- No manual session ID copy-paste required
-- OAuth callback automatically completes authentication
-- Client tracks user_id for seamless calendar access
-
-WORKFLOW:
-1. User asks to see calendar
-2. AI calls connect_google_calendar(user_id="...")
-3. Browser opens automatically (local) or shows auth URL (cloud)
-4. User signs in with Google
-5. Callback completes - user is connected
-6. Calendar tools work automatically
-
 Run:
     python http_client.py
     python http_client.py http://localhost:8000/mcp
@@ -382,6 +369,9 @@ For cloud deployments:
         print("\nTry: 'show my calendar' or 'add meeting tomorrow at 2pm'")
         print("=" * 60 + "\n")
 
+        if self.session is None:
+            raise ValueError("Initialize first")
+
         while True:
             try:
                 user_input = input("\n👤 You: ").strip()
@@ -430,6 +420,59 @@ For cloud deployments:
                 if user_input.lower() == "user-connected":
                     config = await self.read_resource("users://connected")
                     print(f"\n⚙️ Server Config:\n{config}")
+                    continue
+
+                if user_input.lower().startswith("read "):
+                    uri = user_input[5:].strip()
+                    try:
+                        from pydantic import AnyUrl
+
+                        result = await self.session.read_resource(AnyUrl(uri))
+                        print(f"\n📖 Resource content ({uri}):")
+                        for content in result.contents:
+                            if hasattr(content, "text"):
+                                print(content.text)  # type: ignore
+                            else:
+                                print(str(content))
+                    except Exception as e:
+                        print(f"\n❌ Error reading resource: {e}")
+                    continue
+
+                if user_input.lower().startswith("use "):
+                    prompt_name = user_input[4:].strip()
+                    # Find the prompt
+                    prompt_info = next(
+                        (p for p in self.prompts if p.name == prompt_name), None
+                    )
+                    if not prompt_info:
+                        print(f"\n❌ Prompt '{prompt_name}' not found")
+                        continue
+
+                    # Collect arguments if needed
+                    args = {}
+                    if prompt_info.arguments:
+                        print(f"\nEnter arguments for '{prompt_name}':")
+                        for arg in prompt_info.arguments:
+                            required = "(required)" if arg.required else "(optional)"
+                            value = input(f"   {arg.name} {required}: ").strip()
+                            if value:
+                                args[arg.name] = value
+
+                    try:
+                        result = await self.session.get_prompt(
+                            prompt_name, arguments=args
+                        )
+                        # Use the prompt content as the user message
+                        prompt_text = ""
+                        for msg in result.messages:
+                            if hasattr(msg.content, "text"):
+                                prompt_text += msg.content.text + "\n"  # type: ignore
+
+                        print(f"\n📝 Using prompt '{prompt_name}'...")
+                        response = await self.process_message(prompt_text)
+                        print(f"\n🤖 Gemini: {response}")
+                    except Exception as e:
+                        print(f"\n❌ Error using prompt: {e}")
                     continue
 
                 if user_input.lower() == "clear":
